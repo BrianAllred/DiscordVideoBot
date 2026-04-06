@@ -35,6 +35,28 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
         return DownloadQueueStatus.Success;
     }
 
+    /// Get the channel to send informational (non-result) messages to.
+    /// In DMs, this is the same channel. In guilds, this is the user's DM channel.
+    private async Task<IMessageChannel?> GetInfoChannel(DownloadInfo download)
+    {
+        if (download.IsDm)
+            return await client.GetChannelAsync(download.ChannelId) as IMessageChannel;
+
+        var user = await client.GetUserAsync(download.UserId);
+        if (user == null) return null;
+        return await user.CreateDMChannelAsync();
+    }
+
+    private async Task<IMessageChannel?> GetInfoChannelForPending(PendingTranscode pending)
+    {
+        if (pending.IsDm)
+            return await client.GetChannelAsync(pending.ChannelId) as IMessageChannel;
+
+        var user = await client.GetUserAsync(pending.UserId);
+        if (user == null) return null;
+        return await user.CreateDMChannelAsync();
+    }
+
     private async Task StartDownloads()
     {
         if (downloading) return;
@@ -87,14 +109,16 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
                 downloadProc.BeginOutputReadLine();
                 await downloadProc.WaitForExitAsync();
 
-                var channel = await client.GetChannelAsync(download.ChannelId) as IMessageChannel;
-                if (channel == null) continue;
-
                 if (output.Contains("Unsupported URL"))
                 {
-                    var replyBuilder = new StringBuilder("Failed to find video, are you sure this website/format is supported?\n\n");
-                    replyBuilder.AppendLine("Please check the list of supported sites [here](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).");
-                    await channel.SendMessageAsync(replyBuilder.ToString(), messageReference: new MessageReference(download.ReplyId));
+                    var infoChannel = await GetInfoChannel(download);
+                    if (infoChannel != null)
+                    {
+                        var replyBuilder = new StringBuilder("Failed to find video, are you sure this website/format is supported?\n\n");
+                        replyBuilder.AppendLine("Please check the list of supported sites [here](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).");
+                        await infoChannel.SendMessageAsync(replyBuilder.ToString(),
+                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null);
+                    }
                     continue;
                 }
 
@@ -111,23 +135,33 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
                         ChannelId = download.ChannelId,
                         ReplyId = download.ReplyId,
                         UserId = userId,
-                        FileSizeLimit = download.FileSizeLimit
+                        FileSizeLimit = download.FileSizeLimit,
+                        IsDm = download.IsDm
                     };
 
                     var builder = new ComponentBuilder()
                         .WithButton("Transcode for Discord", $"transcode:{pendingId}", ButtonStyle.Primary)
                         .WithButton("Get original", $"original:{pendingId}", ButtonStyle.Secondary);
 
-                    await channel.SendMessageAsync(
-                        "This video needs transcoding to send via Discord.\n\nTranscoding will reduce quality, especially for large/long videos.\n\nWhat would you like to do?",
-                        messageReference: new MessageReference(download.ReplyId),
-                        components: builder.Build());
+                    var infoChannel = await GetInfoChannel(download);
+                    if (infoChannel != null)
+                    {
+                        await infoChannel.SendMessageAsync(
+                            "This video needs transcoding to send via Discord.\n\nTranscoding will reduce quality, especially for large/long videos.\n\nWhat would you like to do?",
+                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null,
+                            components: builder.Build());
+                    }
                     continue;
                 }
 
                 if (NeedTranscode(videoFileInfo, download.FileSizeLimit))
                 {
-                    await channel.SendMessageAsync($"Video `{download.VideoUrl}` must be transcoded, please wait.", messageReference: new MessageReference(download.ReplyId));
+                    var infoChannel = await GetInfoChannel(download);
+                    if (infoChannel != null)
+                    {
+                        await infoChannel.SendMessageAsync($"Video `{download.VideoUrl}` must be transcoded, please wait.",
+                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null);
+                    }
                     TranscodeVideo(filePath, download.FileSizeLimit);
                     filePath = $"{Path.GetFileNameWithoutExtension(filePath)}.mp4";
                 }
@@ -138,12 +172,13 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
             {
                 try
                 {
-                    var channel = await client.GetChannelAsync(download.ChannelId) as IMessageChannel;
-                    if (channel != null)
+                    var infoChannel = await GetInfoChannel(download);
+                    if (infoChannel != null)
                     {
                         var replyBuilder = new StringBuilder($"Sorry, something went wrong downloading `{download.VideoUrl}`. I can't (currently!) access private videos, so please make sure it's available to the public.\n\n");
                         replyBuilder.AppendLine("If that's not the problem, contact the bot owner for more help.");
-                        await channel.SendMessageAsync(replyBuilder.ToString(), messageReference: new MessageReference(download.ReplyId));
+                        await infoChannel.SendMessageAsync(replyBuilder.ToString(),
+                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null);
                     }
                 }
                 catch (Exception innerEx)
@@ -173,25 +208,32 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
         if (!PendingTranscodeChoices.TryRemove(pendingId, out var pending))
             throw new InvalidOperationException("Choice no longer available");
 
-        var channel = await client.GetChannelAsync(pending.ChannelId) as IMessageChannel;
-        if (channel == null) throw new Exception("Channel not found");
+        var infoChannel = await GetInfoChannelForPending(pending);
 
         if (transcode)
         {
-            await channel.SendMessageAsync("Transcoding, please wait.", messageReference: new MessageReference(pending.ReplyId));
+            if (infoChannel != null)
+                await infoChannel.SendMessageAsync("Transcoding, please wait.");
             TranscodeVideo(pending.FilePath, pending.FileSizeLimit);
             var transcodedPath = $"{Path.GetFileNameWithoutExtension(pending.FilePath)}.mp4";
             await SendVideo(pending.ChannelId, pending.ReplyId, transcodedPath);
         }
         else
         {
-            await channel.SendMessageAsync("Uploading, please wait.", messageReference: new MessageReference(pending.ReplyId));
+            if (infoChannel != null)
+                await infoChannel.SendMessageAsync("Uploading, please wait.");
             var objectKey = $"{pending.UserId}/{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{Path.GetFileName(pending.FilePath)}";
             var presignedUrl = await s3.UploadAndGetPresignedUrl(pending.FilePath, objectKey);
             var expiryDays = s3.PresignExpiryDays;
-            await channel.SendMessageAsync(
-                $"Here's your original video. This link expires in {expiryDays} day{(expiryDays != 1 ? "s" : "")}:\n{presignedUrl}",
-                messageReference: new MessageReference(pending.ReplyId));
+
+            // Send the presigned URL to the original channel (it's the result, not informational)
+            var channel = await client.GetChannelAsync(pending.ChannelId) as IMessageChannel;
+            if (channel != null)
+            {
+                await channel.SendMessageAsync(
+                    $"Here's your original video. This link expires in {expiryDays} day{(expiryDays != 1 ? "s" : "")}:\n{presignedUrl}",
+                    messageReference: new MessageReference(pending.ReplyId));
+            }
             File.Delete(pending.FilePath);
         }
     }

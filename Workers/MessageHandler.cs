@@ -24,20 +24,20 @@ public class MessageHandler
         botName = config.BotName is { Length: > 0 } name ? name : "Frozen's Video Bot";
     }
 
-    public async Task HandleMessageAsync(SocketMessage socketMessage)
+    public Task HandleMessage(SocketMessage socketMessage)
     {
-        if (socketMessage is not SocketUserMessage message) return;
-        if (message.Author.IsBot) return;
-        if (message.Author.Id == client.CurrentUser.Id) return;
+        if (socketMessage is not SocketUserMessage message) return Task.CompletedTask;
+        if (message.Author.IsBot) return Task.CompletedTask;
+        if (message.Author.Id == client.CurrentUser.Id) return Task.CompletedTask;
 
         var messageText = message.Content;
-        if (string.IsNullOrWhiteSpace(messageText)) return;
+        if (string.IsNullOrWhiteSpace(messageText)) return Task.CompletedTask;
 
         // Only respond in DMs or when mentioned in a guild
         var isDm = message.Channel is IDMChannel;
         var isMentioned = !isDm && message.MentionedUsers.Any(u => u.Id == client.CurrentUser.Id);
 
-        if (!isDm && !isMentioned) return;
+        if (!isDm && !isMentioned) return Task.CompletedTask;
 
         // Strip the bot mention from the message text if mentioned in a guild
         if (isMentioned)
@@ -49,29 +49,39 @@ public class MessageHandler
         }
 
         var splitMessage = messageText.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (splitMessage.Length < 1)
+
+        // Fire off actual work on a background thread to avoid blocking the gateway
+        _ = Task.Run(async () =>
         {
-            // Mentioned with no content - show help
-            if (isMentioned)
+            try
             {
-                await HandleHelp(message);
+                if (splitMessage.Length < 1)
+                {
+                    if (isMentioned) await HandleHelp(message);
+                    return;
+                }
+
+                if (splitMessage[0].StartsWith("/download") || splitMessage[0].StartsWith("!download"))
+                {
+                    await HandleDownload(message, messageText);
+                    return;
+                }
+
+                if (splitMessage[0].StartsWith('/') || splitMessage[0].StartsWith('!'))
+                {
+                    await HandleHelp(message);
+                    return;
+                }
+
+                await HandleDownload(message, messageText);
             }
-            return;
-        }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error handling message");
+            }
+        });
 
-        if (splitMessage[0].StartsWith("/download") || splitMessage[0].StartsWith("!download"))
-        {
-            await HandleDownload(message, messageText);
-            return;
-        }
-
-        if (splitMessage[0].StartsWith('/') || splitMessage[0].StartsWith('!'))
-        {
-            await HandleHelp(message);
-            return;
-        }
-
-        await HandleDownload(message, messageText);
+        return Task.CompletedTask;
     }
 
     public async Task HandleButtonAsync(SocketMessageComponent component)
@@ -98,44 +108,51 @@ public class MessageHandler
             return;
         }
 
-        // Remove the buttons immediately to prevent double-clicks
-        try
-        {
-            await component.UpdateAsync(msg => msg.Components = new ComponentBuilder().Build());
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Failed to remove buttons");
-        }
+        // Acknowledge the interaction immediately by removing the buttons,
+        // then do the heavy work off the gateway task
+        await component.UpdateAsync(msg => msg.Components = new ComponentBuilder().Build());
 
         var isTranscode = action == "transcode";
 
-        try
+        _ = Task.Run(async () =>
         {
-            if (!downloadManagers.TryGetValue(pending.UserId, out var manager))
+            try
             {
-                manager = new(client, pending.UserId, config.DownloadQueueLimit, s3, logger);
-                downloadManagers[pending.UserId] = manager;
-            }
+                if (!downloadManagers.TryGetValue(pending.UserId, out var manager))
+                {
+                    manager = new(client, pending.UserId, config.DownloadQueueLimit, s3, logger);
+                    downloadManagers[pending.UserId] = manager;
+                }
 
-            await manager.HandleTranscodeChoice(pendingId, isTranscode);
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Failed to handle transcode choice");
-            await component.FollowupAsync("Sorry, something went wrong processing your choice.");
-        }
+                await manager.HandleTranscodeChoice(pendingId, isTranscode);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to handle transcode choice");
+                try
+                {
+                    await component.FollowupAsync("Sorry, something went wrong processing your choice.");
+                }
+                catch (Exception innerEx)
+                {
+                    logger.LogError(innerEx, "Failed to send error followup");
+                }
+            }
+        });
     }
 
     private async Task HandleDownload(SocketUserMessage message, string messageText)
     {
         var userId = message.Author.Id;
+        var isDm = message.Channel is IDMChannel;
 
         var downloadUrls = messageText.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
         if (downloadUrls.Length == 0 || (downloadUrls.Length == 1 && (downloadUrls[0].StartsWith("/download") || downloadUrls[0].StartsWith("!download"))))
         {
-            await message.ReplyAsync("No URL included in message.");
+            IMessageChannel noUrlChannel = isDm ? message.Channel : await message.Author.CreateDMChannelAsync();
+            await noUrlChannel.SendMessageAsync("No URL included in message.",
+                messageReference: isDm ? new MessageReference(message.Id) : null);
             return;
         }
 
@@ -162,8 +179,10 @@ public class MessageHandler
                 {
                     ChannelId = message.Channel.Id,
                     ReplyId = message.Id,
+                    UserId = userId,
                     VideoUrl = url,
-                    FileSizeLimit = fileSizeLimit
+                    FileSizeLimit = fileSizeLimit,
+                    IsDm = isDm
                 }));
             }
         }
@@ -199,7 +218,15 @@ public class MessageHandler
             replyBuilder.AppendJoin('\n', queueStatuses.Where(pair => pair.Value == Enums.DownloadQueueStatus.UnknownError).Select(pair => $"`{pair.Key}`"));
         }
 
-        await message.ReplyAsync(replyBuilder.ToString());
+        if (isDm)
+        {
+            await message.ReplyAsync(replyBuilder.ToString());
+        }
+        else
+        {
+            var dmChannel = await message.Author.CreateDMChannelAsync();
+            await dmChannel.SendMessageAsync(replyBuilder.ToString());
+        }
     }
 
     private int GetFileSizeLimit(IChannel channel)

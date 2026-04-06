@@ -27,7 +27,7 @@ public class DiscordBotService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _client.Log += LogAsync;
-        _client.MessageReceived += _messageHandler.HandleMessageAsync;
+        _client.MessageReceived += _messageHandler.HandleMessage;
         _client.ButtonExecuted += _messageHandler.HandleButtonAsync;
 
         await _client.LoginAsync(TokenType.Bot, _config.DiscordBotToken);
@@ -42,7 +42,7 @@ public class DiscordBotService : BackgroundService
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         _client.Log -= LogAsync;
-        _client.MessageReceived -= _messageHandler.HandleMessageAsync;
+        _client.MessageReceived -= _messageHandler.HandleMessage;
         _client.ButtonExecuted -= _messageHandler.HandleButtonAsync;
 
         await _client.StopAsync();
