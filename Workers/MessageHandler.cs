@@ -55,15 +55,28 @@ public class MessageHandler
         {
             try
             {
+                // If the message has no URLs and is a reply, use URLs from the referenced message
+                var referencedText = GetReferencedMessageUrls(message);
+
                 if (splitMessage.Length < 1)
                 {
+                    if (referencedText != null)
+                    {
+                        await HandleDownload(message, referencedText);
+                        return;
+                    }
                     if (isMentioned) await HandleHelp(message);
                     return;
                 }
 
                 if (splitMessage[0].StartsWith("/download") || splitMessage[0].StartsWith("!download"))
                 {
-                    await HandleDownload(message, messageText);
+                    var downloadText = messageText;
+                    // If the only content is the command itself with no URLs, check the reply
+                    var commandArgs = splitMessage.Length > 1 ? splitMessage[1..] : [];
+                    if (!commandArgs.Any(HasUrl) && referencedText != null)
+                        downloadText = $"{splitMessage[0]} {referencedText}";
+                    await HandleDownload(message, downloadText);
                     return;
                 }
 
@@ -72,6 +85,10 @@ public class MessageHandler
                     await HandleHelp(message);
                     return;
                 }
+
+                // If the message has no URLs but is a reply, use the referenced message
+                if (!splitMessage.Any(HasUrl) && referencedText != null)
+                    messageText = referencedText;
 
                 await HandleDownload(message, messageText);
             }
@@ -243,6 +260,26 @@ public class MessageHandler
 
         // DMs or unknown channel types fall back to the configured limit
         return config.FileSizeLimit;
+    }
+
+    private static bool HasUrl(string token) =>
+        Uri.TryCreate(token, UriKind.Absolute, out var uri) && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+
+    /// <summary>
+    /// If the message is a reply to another message, extract any URLs from the referenced message.
+    /// Returns a space-separated string of URLs, or null if there are none.
+    /// </summary>
+    private static string? GetReferencedMessageUrls(SocketUserMessage message)
+    {
+        if (message.ReferencedMessage is not { Content: { Length: > 0 } content })
+            return null;
+
+        var urls = content
+            .Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(HasUrl)
+            .ToArray();
+
+        return urls.Length > 0 ? string.Join(' ', urls) : null;
     }
 
     private async Task HandleHelp(SocketUserMessage message)
