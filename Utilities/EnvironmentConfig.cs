@@ -9,8 +9,8 @@ public class EnvironmentConfig
     public string YtDlpUpdateBranch => Environment.GetEnvironmentVariable("YTDLP_UPDATE_BRANCH") ?? "release";
 
     // Used as fallback for DMs. In guild channels, the bot auto-detects the upload limit
-    // from the server's boost tier (25MB default, 50MB Tier 2, 100MB Tier 3).
-    public int FileSizeLimit => int.Parse(Environment.GetEnvironmentVariable("FILE_SIZE_LIMIT") ?? "25");
+    // from the server's boost tier (10MB default, 50MB Tier 2, 100MB Tier 3).
+    public int FileSizeLimit => int.Parse(Environment.GetEnvironmentVariable("FILE_SIZE_LIMIT") ?? "10");
 
     // S3-compatible storage (works with AWS S3, Garage, MinIO, Backblaze B2, etc.)
     public string? S3Endpoint => Environment.GetEnvironmentVariable("S3_ENDPOINT");

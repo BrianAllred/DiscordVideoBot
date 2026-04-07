@@ -254,7 +254,7 @@ public class MessageHandler
             {
                 PremiumTier.Tier2 => 50,
                 PremiumTier.Tier3 => 100,
-                _ => 25
+                _ => 10
             };
         }
 
