@@ -266,8 +266,8 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
                         .WithArgument(new CustomArgument($"-maxrate:v {videoBitRate}k"))
                         .WithArgument(new CustomArgument($"-bufsize:v {targetSizeInKiloBits * 1000 / 20}"))
                         .WithFastStart())
-                        .NotifyOnError((err) => { logger.LogError(err); })
-                        .NotifyOnOutput((output) => { logger.LogInformation(output); })
+                        .NotifyOnStandardError((err) => { logger.LogError(err); })
+                        .NotifyOnStandardOutput((output) => { logger.LogInformation(output); })
                         .ProcessSynchronously();
         }
         catch (FFMpegException ex)
