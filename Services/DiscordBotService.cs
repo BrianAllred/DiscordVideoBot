@@ -12,6 +12,9 @@ public class DiscordBotService : BackgroundService
     private readonly EnvironmentConfig _config;
     private readonly ILogger<DiscordBotService> _logger;
 
+    // Ready fires again after reconnects, but the commands only need registering once per process.
+    private bool _commandsRegistered;
+
     public DiscordBotService(
         DiscordSocketClient client,
         MessageHandler messageHandler,
@@ -29,6 +32,8 @@ public class DiscordBotService : BackgroundService
         _client.Log += LogAsync;
         _client.MessageReceived += _messageHandler.HandleMessage;
         _client.ButtonExecuted += _messageHandler.HandleButtonAsync;
+        _client.SlashCommandExecuted += _messageHandler.HandleSlashCommand;
+        _client.Ready += RegisterCommandsAsync;
 
         await _client.LoginAsync(TokenType.Bot, _config.DiscordBotToken);
         await _client.StartAsync();
@@ -44,9 +49,38 @@ public class DiscordBotService : BackgroundService
         _client.Log -= LogAsync;
         _client.MessageReceived -= _messageHandler.HandleMessage;
         _client.ButtonExecuted -= _messageHandler.HandleButtonAsync;
+        _client.SlashCommandExecuted -= _messageHandler.HandleSlashCommand;
+        _client.Ready -= RegisterCommandsAsync;
 
         await _client.StopAsync();
         await base.StopAsync(cancellationToken);
+    }
+
+    // Slash commands can be answered with ephemeral messages, which only the requester sees.
+    private async Task RegisterCommandsAsync()
+    {
+        if (_commandsRegistered) return;
+
+        try
+        {
+            await _client.BulkOverwriteGlobalApplicationCommandsAsync(
+            [
+                new SlashCommandBuilder()
+                    .WithName("download")
+                    .WithDescription("Download a video from a URL")
+                    .AddOption("url", ApplicationCommandOptionType.String, "Video URL (separate multiple URLs with spaces)", isRequired: true)
+                    .Build(),
+                new SlashCommandBuilder()
+                    .WithName("help")
+                    .WithDescription("Show help")
+                    .Build()
+            ]);
+            _commandsRegistered = true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to register slash commands");
+        }
     }
 
     private Task LogAsync(LogMessage log)

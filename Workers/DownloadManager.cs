@@ -1,7 +1,11 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using Discord;
+using Discord.Net;
+using Discord.WebSocket;
 using FFMpegCore;
 using FFMpegCore.Arguments;
 using FFMpegCore.Enums;
@@ -11,242 +15,275 @@ using static DiscordVideoBot.Utilities.Enums;
 
 namespace DiscordVideoBot.Workers;
 
-public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit, S3StorageService s3, ILogger logger)
+public class DownloadManager
 {
-    private readonly ConcurrentQueue<DownloadInfo> downloads = new();
-    private readonly ulong userId = userId;
-    private readonly IDiscordClient client = client;
-    private readonly int queueLimit = queueLimit;
-    private readonly ILogger logger = logger;
-    private readonly S3StorageService s3 = s3;
+    private readonly Channel<DownloadInfo> downloads;
+    private readonly ulong userId;
+    private readonly IDiscordClient client;
+    private readonly ILogger logger;
+    private readonly S3StorageService s3;
 
-    private bool downloading;
+    public DownloadManager(IDiscordClient client, ulong userId, int queueLimit, S3StorageService s3, ILogger logger)
+    {
+        this.client = client;
+        this.userId = userId;
+        this.s3 = s3;
+        this.logger = logger;
+
+        // The bounded channel enforces the queue limit, and its single reader keeps each user's downloads sequential.
+        downloads = Channel.CreateBounded<DownloadInfo>(queueLimit);
+        _ = Task.Run(ProcessDownloads);
+    }
 
     public DownloadQueueStatus QueueDownload(DownloadInfo download)
     {
-        if (downloads.Count >= queueLimit) return DownloadQueueStatus.QueueFull;
-
         if (!Uri.TryCreate(download.VideoUrl, UriKind.Absolute, out var uriResult) || !(uriResult.Scheme == Uri.UriSchemeHttp || uriResult.Scheme == Uri.UriSchemeHttps)) return DownloadQueueStatus.InvalidUrl;
 
-        downloads.Enqueue(download);
-
-        _ = Task.Run(() => StartDownloads());
-
-        return DownloadQueueStatus.Success;
+        return downloads.Writer.TryWrite(download) ? DownloadQueueStatus.Success : DownloadQueueStatus.QueueFull;
     }
 
-    /// Get the channel to send informational (non-result) messages to.
-    /// In DMs, this is the same channel. In guilds, this is the user's DM channel.
-    private async Task<IMessageChannel?> GetInfoChannel(DownloadInfo download)
+    private async Task ProcessDownloads()
     {
-        if (download.IsDm)
-            return await client.GetChannelAsync(download.ChannelId) as IMessageChannel;
+        await foreach (var download in downloads.Reader.ReadAllAsync())
+        {
+            await Download(download);
+        }
+    }
+
+    /// <summary>
+    /// Sends an informational (non-result) message only the requester sees.
+    /// Goes through <paramref name="interaction"/> (default: the /download command) while its token is valid, ephemeral in guilds.
+    /// Otherwise it goes to the user's DMs, replying to the request if it was made there.
+    /// </summary>
+    private async Task SendInfo(DownloadInfo download, string text, MessageComponent? components = null, SocketInteraction? interaction = null)
+    {
+        if (await TryFollowup(interaction ?? download.Command, i => i.FollowupAsync(text, components: components, ephemeral: !i.IsDMInteraction)))
+            return;
 
         var user = await client.GetUserAsync(download.UserId);
-        if (user == null) return null;
-        return await user.CreateDMChannelAsync();
+        if (user == null) return;
+        var dmChannel = await user.CreateDMChannelAsync();
+        await dmChannel.SendMessageAsync(text,
+            messageReference: download.IsDm && download.ReplyId != 0 ? new MessageReference(download.ReplyId) : null,
+            components: components);
     }
 
-    private async Task<IMessageChannel?> GetInfoChannelForPending(PendingTranscode pending)
+    // Interaction tokens expire after 15 minutes. Returns false when the interaction can't be used, so the caller falls back.
+    private async Task<bool> TryFollowup(SocketInteraction? interaction, Func<SocketInteraction, Task> followup)
     {
-        if (pending.IsDm)
-            return await client.GetChannelAsync(pending.ChannelId) as IMessageChannel;
+        if (interaction is not { IsValidToken: true }) return false;
 
-        var user = await client.GetUserAsync(pending.UserId);
-        if (user == null) return null;
-        return await user.CreateDMChannelAsync();
-    }
-
-    private async Task StartDownloads()
-    {
-        if (downloading) return;
-
-        while (downloads.TryDequeue(out var download))
+        try
         {
-            try
-            {
-                downloading = true;
-                foreach (var existingFile in Directory.GetFiles("./").Where(file => file.StartsWith($"./{userId}")))
-                {
-                    var path = existingFile[2..];
-                    // Don't delete files that have a pending transcode choice
-                    if (PendingTranscodeChoices.Values.Any(p => p.FilePath == path))
-                        continue;
-                    if (File.Exists(path))
-                        File.Delete(path);
-                }
-
-                var downloadId = Guid.NewGuid().ToString("N")[..8];
-                var downloadProcInfo = new ProcessStartInfo("yt-dlp")
-                {
-                    // adding remote-components here as per https://github.com/yt-dlp/yt-dlp/wiki/EJS
-                    // NOTE that this adds a dependency on deno or similar EJS runtime
-                    Arguments = $"-f \"bv*+ba/b\" --remote-components ejs:github -o {userId}_{downloadId}.%(ext)s {download.VideoUrl}",
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true
-                };
-
-                var downloadProc = new Process
-                {
-                    StartInfo = downloadProcInfo,
-                    EnableRaisingEvents = true
-                };
-
-                var output = string.Empty;
-                downloadProc.ErrorDataReceived += (sender, o) =>
-                {
-                    output += o.Data;
-                    logger.LogError(o.Data);
-                };
-                downloadProc.OutputDataReceived += (sender, o) =>
-                {
-                    output += o.Data;
-                    logger.LogInformation(o.Data);
-                };
-
-                downloadProc.Start();
-                downloadProc.BeginErrorReadLine();
-                downloadProc.BeginOutputReadLine();
-                await downloadProc.WaitForExitAsync();
-
-                if (output.Contains("Unsupported URL"))
-                {
-                    var infoChannel = await GetInfoChannel(download);
-                    if (infoChannel != null)
-                    {
-                        var replyBuilder = new StringBuilder("Failed to find video, are you sure this website/format is supported?\n\n");
-                        replyBuilder.AppendLine("Please check the list of supported sites [here](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).");
-                        await infoChannel.SendMessageAsync(replyBuilder.ToString(),
-                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null);
-                    }
-                    continue;
-                }
-
-                var filePath = Directory.GetFiles("./").First(file => file.StartsWith($"./{userId}_{downloadId}"))[2..];
-
-                var videoFileInfo = new FileInfo(filePath);
-
-                if (NeedTranscode(videoFileInfo, download.FileSizeLimit) && s3.IsEnabled)
-                {
-                    var pendingId = Guid.NewGuid().ToString("N")[..8];
-                    PendingTranscodeChoices[pendingId] = new PendingTranscode
-                    {
-                        FilePath = filePath,
-                        ChannelId = download.ChannelId,
-                        ReplyId = download.ReplyId,
-                        UserId = userId,
-                        FileSizeLimit = download.FileSizeLimit,
-                        IsDm = download.IsDm
-                    };
-
-                    var builder = new ComponentBuilder()
-                        .WithButton("Transcode for Discord", $"transcode:{pendingId}", ButtonStyle.Primary)
-                        .WithButton("Get original", $"original:{pendingId}", ButtonStyle.Secondary);
-
-                    var infoChannel = await GetInfoChannel(download);
-                    if (infoChannel != null)
-                    {
-                        await infoChannel.SendMessageAsync(
-                            "This video needs transcoding to send via Discord.\n\nTranscoding will reduce quality, especially for large/long videos.\n\nWhat would you like to do?",
-                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null,
-                            components: builder.Build());
-                    }
-                    continue;
-                }
-
-                if (NeedTranscode(videoFileInfo, download.FileSizeLimit))
-                {
-                    var infoChannel = await GetInfoChannel(download);
-                    if (infoChannel != null)
-                    {
-                        await infoChannel.SendMessageAsync($"Video `{download.VideoUrl}` must be transcoded, please wait.",
-                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null);
-                    }
-                    TranscodeVideo(filePath, download.FileSizeLimit);
-                    filePath = $"{Path.GetFileNameWithoutExtension(filePath)}.mp4";
-                }
-
-                await SendVideo(download.ChannelId, download.ReplyId, filePath);
-            }
-            catch (Exception ex)
-            {
-                try
-                {
-                    var infoChannel = await GetInfoChannel(download);
-                    if (infoChannel != null)
-                    {
-                        var replyBuilder = new StringBuilder($"Sorry, something went wrong downloading `{download.VideoUrl}`. I can't (currently!) access private videos, so please make sure it's available to the public.\n\n");
-                        replyBuilder.AppendLine("If that's not the problem, contact the bot owner for more help.");
-                        await infoChannel.SendMessageAsync(replyBuilder.ToString(),
-                            messageReference: download.IsDm ? new MessageReference(download.ReplyId) : null);
-                    }
-                }
-                catch (Exception innerEx)
-                {
-                    logger.LogError(innerEx, innerEx.Message);
-                }
-                logger.LogError(ex, ex.Message);
-            }
-            finally
-            {
-                downloading = false;
-            }
+            await followup(interaction);
+            return true;
+        }
+        // Only an expired token falls back.
+        catch (HttpException ex) when (ex.DiscordCode is DiscordErrorCode.InvalidWebhookToken or DiscordErrorCode.UnknownWebhook)
+        {
+            logger.LogInformation("Interaction no longer usable ({Error}), falling back to a normal message", ex.Message);
+            return false;
         }
     }
 
-    private async Task SendVideo(ulong channelId, ulong replyId, string filePath)
+    // Error replies must not throw, or they'd hide the original error.
+    private async Task ReplyError(DownloadInfo download, string text, SocketInteraction? interaction = null)
     {
-        var channel = await client.GetChannelAsync(channelId) as IMessageChannel;
+        try
+        {
+            await SendInfo(download, text, interaction: interaction);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to send error reply");
+        }
+    }
+
+    // Must not throw: that would end ProcessDownloads and strand the user's queue.
+    private async Task Download(DownloadInfo download)
+    {
+        // Every file this download creates (yt-dlp parts, the video, transcode output) starts with this prefix.
+        var filePrefix = $"{userId}_{Guid.NewGuid().ToString("N")[..8]}";
+        var awaitingChoice = false;
+
+        try
+        {
+            var downloadProcInfo = new ProcessStartInfo("yt-dlp")
+            {
+                // adding remote-components here as per https://github.com/yt-dlp/yt-dlp/wiki/EJS
+                // NOTE that this adds a dependency on deno or similar EJS runtime
+                Arguments = $"-f \"bv*+ba/b\" --remote-components ejs:github -o {filePrefix}.%(ext)s {download.VideoUrl}",
+                RedirectStandardError = true,
+                RedirectStandardOutput = true
+            };
+
+            var downloadProc = new Process
+            {
+                StartInfo = downloadProcInfo,
+                EnableRaisingEvents = true
+            };
+
+            var output = string.Empty;
+            downloadProc.ErrorDataReceived += (sender, o) =>
+            {
+                output += o.Data;
+                logger.LogError(o.Data);
+            };
+            downloadProc.OutputDataReceived += (sender, o) =>
+            {
+                output += o.Data;
+                logger.LogInformation(o.Data);
+            };
+
+            downloadProc.Start();
+            downloadProc.BeginErrorReadLine();
+            downloadProc.BeginOutputReadLine();
+            await downloadProc.WaitForExitAsync();
+
+            if (output.Contains("Unsupported URL"))
+            {
+                var replyBuilder = new StringBuilder("Failed to find video, are you sure this website/format is supported?\n\n");
+                replyBuilder.AppendLine("Please check the list of supported sites [here](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).");
+                await SendInfo(download, replyBuilder.ToString());
+                return;
+            }
+
+            var filePath = Directory.GetFiles("./").First(file => file.StartsWith($"./{filePrefix}"))[2..];
+            var needTranscode = NeedTranscode(new FileInfo(filePath), download.FileSizeLimit);
+
+            if (needTranscode && s3.IsEnabled)
+            {
+                var pendingId = Guid.NewGuid().ToString("N")[..8];
+                PendingTranscodeChoices[pendingId] = new PendingTranscode
+                {
+                    FilePath = filePath,
+                    Download = download
+                };
+                awaitingChoice = true;
+                _ = ExpirePendingChoice(pendingId);
+
+                var builder = new ComponentBuilder()
+                    .WithButton("Transcode for Discord", $"transcode:{pendingId}", ButtonStyle.Primary)
+                    .WithButton("Get original", $"original:{pendingId}", ButtonStyle.Secondary);
+
+                await SendInfo(download,
+                    "This video needs transcoding to send via Discord.\n\nTranscoding will reduce quality, especially for large/long videos.\n\nWhat would you like to do?",
+                    builder.Build());
+                return;
+            }
+
+            if (needTranscode)
+            {
+                await SendInfo(download, $"Video `{download.VideoUrl}` must be transcoded, please wait.");
+                filePath = await TranscodeVideo(filePath, download.FileSizeLimit);
+            }
+
+            await SendVideo(download, filePath);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, ex.Message);
+            var replyBuilder = new StringBuilder($"Sorry, something went wrong downloading `{download.VideoUrl}`. I can't (currently!) access private videos, so please make sure it's available to the public.\n\n");
+            replyBuilder.AppendLine("If that's not the problem, contact the bot owner for more help.");
+            await ReplyError(download, replyBuilder.ToString());
+        }
+        finally
+        {
+            // A file waiting for the user's choice now belongs to that choice.
+            if (!awaitingChoice) DeleteFiles(filePrefix);
+        }
+    }
+
+    private async Task SendVideo(DownloadInfo download, string filePath)
+    {
+        // The /download reply is ephemeral, so the video goes out as its own followup that everyone sees.
+        if (await TryFollowup(download.Command, i => i.FollowupWithFileAsync(filePath)))
+            return;
+
+        var channel = await client.GetChannelAsync(download.ChannelId) as IMessageChannel;
         if (channel == null) throw new Exception("Channel not found");
 
-        await channel.SendFileAsync(filePath, messageReference: new MessageReference(replyId));
-        File.Delete(filePath);
+        await channel.SendFileAsync(filePath, messageReference: download.ReplyId != 0 ? new MessageReference(download.ReplyId) : null);
     }
 
-    public async Task HandleTranscodeChoice(string pendingId, bool transcode)
+    /// <summary>
+    /// The caller must have removed <paramref name="pending"/> from <see cref="PendingTranscodeChoices"/>.
+    /// <paramref name="choice"/> is the button press, used to reply to the requester.
+    /// </summary>
+    public async Task HandleTranscodeChoice(PendingTranscode pending, bool transcode, SocketInteraction choice)
     {
-        if (!PendingTranscodeChoices.TryRemove(pendingId, out var pending))
-            throw new InvalidOperationException("Choice no longer available");
-
-        var infoChannel = await GetInfoChannelForPending(pending);
-
-        if (transcode)
+        var download = pending.Download;
+        try
         {
-            if (infoChannel != null)
-                await infoChannel.SendMessageAsync("Transcoding, please wait.");
-            TranscodeVideo(pending.FilePath, pending.FileSizeLimit);
-            var transcodedPath = $"{Path.GetFileNameWithoutExtension(pending.FilePath)}.mp4";
-            await SendVideo(pending.ChannelId, pending.ReplyId, transcodedPath);
-        }
-        else
-        {
-            if (infoChannel != null)
-                await infoChannel.SendMessageAsync("Uploading, please wait.");
-            var objectKey = $"{pending.UserId}/{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{Path.GetFileName(pending.FilePath)}";
+            if (transcode)
+            {
+                await SendVideo(download, await TranscodeVideo(pending.FilePath, download.FileSizeLimit));
+                return;
+            }
+
+            var objectKey = $"{download.UserId}/{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}_{Path.GetFileName(pending.FilePath)}";
             var presignedUrl = await s3.UploadAndGetPresignedUrl(pending.FilePath, objectKey);
             var expiryDays = s3.PresignExpiryDays;
 
-            // Send the presigned URL to the original channel (it's the result, not informational)
-            var channel = await client.GetChannelAsync(pending.ChannelId) as IMessageChannel;
-            if (channel != null)
-            {
-                await channel.SendMessageAsync(
-                    $"Here's your original video. This link expires in {expiryDays} day{(expiryDays != 1 ? "s" : "")}:\n{presignedUrl}",
-                    messageReference: new MessageReference(pending.ReplyId));
-            }
-            File.Delete(pending.FilePath);
+            // Anyone with the link can download the video, so it only goes to the requester.
+            await SendInfo(download, $"Here's your original video. This link expires in {expiryDays} day{(expiryDays != 1 ? "s" : "")}:\n{presignedUrl}", interaction: choice);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to handle transcode choice");
+            await ReplyError(download, "Sorry, something went wrong processing your choice.", choice);
+        }
+        finally
+        {
+            DeleteFiles(Path.GetFileNameWithoutExtension(pending.FilePath));
         }
     }
 
     public static readonly ConcurrentDictionary<string, PendingTranscode> PendingTranscodeChoices = new();
 
+    // The prompt may be ephemeral and vanish, so an unanswered choice must not keep its file forever.
+    private static readonly TimeSpan PendingChoiceExpiry = TimeSpan.FromHours(1);
+
+    private async Task ExpirePendingChoice(string pendingId)
+    {
+        await Task.Delay(PendingChoiceExpiry);
+        // TryRemove loses to the button handler if the user already chose, so a file in use is never deleted here.
+        if (PendingTranscodeChoices.TryRemove(pendingId, out var pending))
+            DeleteFiles(Path.GetFileNameWithoutExtension(pending.FilePath));
+    }
+
+    private void DeleteFiles(string filePrefix)
+    {
+        foreach (var file in Directory.GetFiles(".", $"{filePrefix}*"))
+        {
+            try
+            {
+                File.Delete(file);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Failed to delete {File}", file);
+            }
+        }
+    }
+
+    // Pending choices only live in memory, so download files left over from a previous run are orphaned.
+    public static void DeleteLeftoverFiles()
+    {
+        foreach (var file in Directory.GetFiles(".").Where(file => Regex.IsMatch(Path.GetFileName(file), @"^\d+_[0-9a-f]{8}[._]")))
+        {
+            File.Delete(file);
+        }
+    }
+
     // https://unix.stackexchange.com/questions/520597/how-to-reduce-the-size-of-a-video-to-a-target-size
-    private void TranscodeVideo(string filePath, int fileSizeLimit)
+    // Returns the path of the transcoded video.
+    private async Task<string> TranscodeVideo(string filePath, int fileSizeLimit)
     {
         var newFilePath = $"{Path.GetFileNameWithoutExtension(filePath)}_new.mp4";
 
         var targetSizeInKiloBits = (fileSizeLimit - 5) * 1000 * 8;
-        var mediaInfo = FFProbe.Analyse(filePath);
+        var mediaInfo = await FFProbe.AnalyseAsync(filePath);
         var totalBitRate = (targetSizeInKiloBits / mediaInfo.Duration.TotalSeconds) + 1;
         var audioBitRate = 128;
         var videoBitRate = (int)(totalBitRate - audioBitRate);
@@ -258,7 +295,7 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
                 File.Delete(newFilePath);
             }
 
-            FFMpegArguments.FromFileInput(filePath, false, options => options
+            await FFMpegArguments.FromFileInput(filePath, false, options => options
                         .WithHardwareAcceleration())
                         .OutputToFile(newFilePath, false, options => options
                         .WithVideoCodec(VideoCodec.LibX264)
@@ -268,7 +305,7 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
                         .WithFastStart())
                         .NotifyOnStandardError((err) => { logger.LogError(err); })
                         .NotifyOnStandardOutput((output) => { logger.LogInformation(output); })
-                        .ProcessSynchronously();
+                        .ProcessAsynchronously();
         }
         catch (FFMpegException ex)
         {
@@ -282,6 +319,7 @@ public class DownloadManager(IDiscordClient client, ulong userId, int queueLimit
         }
 
         File.Move(newFilePath, filePath, true);
+        return filePath;
     }
 
     // Check if video needs to be transcoded.

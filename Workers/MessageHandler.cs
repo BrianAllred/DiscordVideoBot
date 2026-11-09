@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using Discord;
 using Discord.WebSocket;
@@ -8,7 +9,7 @@ namespace DiscordVideoBot.Workers;
 
 public class MessageHandler
 {
-    private readonly Dictionary<ulong, DownloadManager> downloadManagers = [];
+    private readonly ConcurrentDictionary<ulong, DownloadManager> downloadManagers = new();
     private readonly string botName;
     private readonly ILogger<MessageHandler> logger;
     private readonly EnvironmentConfig config;
@@ -113,78 +114,127 @@ public class MessageHandler
 
         if (action is not ("transcode" or "original")) return;
 
+        const string choiceGone = "This choice is no longer available.";
+
         if (!DownloadManager.PendingTranscodeChoices.TryGetValue(pendingId, out var pending))
         {
-            await component.RespondAsync("This choice is no longer available.", ephemeral: true);
+            await component.RespondAsync(choiceGone, ephemeral: true);
             return;
         }
 
-        if (component.User.Id != pending.UserId)
+        var userId = pending.Download.UserId;
+        if (component.User.Id != userId)
         {
             await component.RespondAsync("Only the original requester can do this.", ephemeral: true);
             return;
         }
 
-        // Acknowledge the interaction immediately by removing the buttons,
-        // then do the heavy work off the gateway task
-        await component.UpdateAsync(msg => msg.Components = new ComponentBuilder().Build());
+        // Taking the choice stops the expiry from deleting the file while it's in use, and makes a double click a no-op.
+        if (!DownloadManager.PendingTranscodeChoices.TryRemove(pendingId, out _))
+        {
+            await component.RespondAsync(choiceGone, ephemeral: true);
+            return;
+        }
 
         var isTranscode = action == "transcode";
 
+        // Acknowledge the interaction by swapping the buttons for a status,
+        // then do the heavy work off the gateway task
+        try
+        {
+            await component.UpdateAsync(msg =>
+            {
+                msg.Content = isTranscode ? "Transcoding, please wait." : "Uploading the original video, please wait.";
+                msg.Components = new ComponentBuilder().Build();
+            });
+        }
+        catch (Exception ex)
+        {
+            // The choice is already taken, so carry on: replies fall back to DMs.
+            logger.LogError(ex, "Failed to update the transcode prompt");
+        }
+
+        _ = Task.Run(() => GetManager(userId).HandleTranscodeChoice(pending, isTranscode, component));
+    }
+
+    public Task HandleSlashCommand(SocketSlashCommand command)
+    {
+        // Fire off actual work on a background thread to avoid blocking the gateway
         _ = Task.Run(async () =>
         {
             try
             {
-                if (!downloadManagers.TryGetValue(pending.UserId, out var manager))
+                // Ephemeral replies are only seen by the requester. In DMs they'd just vanish on reload, so DMs get normal replies.
+                var ephemeral = !command.IsDMInteraction;
+
+                if (command.CommandName == "download")
                 {
-                    manager = new(client, pending.UserId, config.DownloadQueueLimit, s3, logger);
-                    downloadManagers[pending.UserId] = manager;
+                    var reply = QueueDownloads(new DownloadInfo
+                    {
+                        ChannelId = command.ChannelId ?? 0,
+                        UserId = command.User.Id,
+                        FileSizeLimit = GetFileSizeLimit(command.GuildId),
+                        IsDm = command.IsDMInteraction,
+                        Command = command
+                    }, (string)command.Data.Options.First().Value);
+                    await command.RespondAsync(reply, ephemeral: ephemeral);
+                    return;
                 }
 
-                await manager.HandleTranscodeChoice(pendingId, isTranscode);
+                var help = HelpMessages(command.GuildId);
+                await command.RespondAsync(help[0], ephemeral: ephemeral);
+                await command.FollowupAsync(help[1], ephemeral: ephemeral);
             }
             catch (Exception ex)
             {
-                logger.LogError(ex, "Failed to handle transcode choice");
-                try
-                {
-                    await component.FollowupAsync("Sorry, something went wrong processing your choice.");
-                }
-                catch (Exception innerEx)
-                {
-                    logger.LogError(innerEx, "Failed to send error followup");
-                }
+                logger.LogError(ex, "Error handling slash command");
             }
         });
+
+        return Task.CompletedTask;
     }
+
+    private DownloadManager GetManager(ulong userId) =>
+        downloadManagers.GetOrAdd(userId, id => new(client, id, config.DownloadQueueLimit, s3, logger));
 
     private async Task HandleDownload(SocketUserMessage message, string messageText)
     {
-        var userId = message.Author.Id;
         var isDm = message.Channel is IDMChannel;
+        var reply = QueueDownloads(new DownloadInfo
+        {
+            ChannelId = message.Channel.Id,
+            ReplyId = message.Id,
+            UserId = message.Author.Id,
+            FileSizeLimit = GetFileSizeLimit((message.Channel as SocketGuildChannel)?.Guild.Id),
+            IsDm = isDm
+        }, messageText);
 
+        // Messages can't get ephemeral replies, so guild requests get their status in DMs.
+        if (isDm)
+        {
+            await message.ReplyAsync(reply);
+        }
+        else
+        {
+            var dmChannel = await message.Author.CreateDMChannelAsync();
+            await dmChannel.SendMessageAsync(reply);
+        }
+    }
+
+    // Queues every URL in the text and returns the status reply.
+    private string QueueDownloads(DownloadInfo request, string messageText)
+    {
         var downloadUrls = messageText.Split(Array.Empty<char>(), StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
         if (downloadUrls.Length == 0 || (downloadUrls.Length == 1 && (downloadUrls[0].StartsWith("/download") || downloadUrls[0].StartsWith("!download"))))
-        {
-            IMessageChannel noUrlChannel = isDm ? message.Channel : await message.Author.CreateDMChannelAsync();
-            await noUrlChannel.SendMessageAsync("No URL included in message.",
-                messageReference: isDm ? new MessageReference(message.Id) : null);
-            return;
-        }
+            return "No URL included in message.";
 
         if (downloadUrls[0].StartsWith("/download") || downloadUrls[0].StartsWith("!download"))
         {
             downloadUrls = downloadUrls[1..];
         }
 
-        if (!downloadManagers.TryGetValue(userId, out var manager))
-        {
-            manager = new(client, userId, config.DownloadQueueLimit, s3, logger);
-            downloadManagers.Add(userId, manager);
-        }
-
-        var fileSizeLimit = GetFileSizeLimit(message.Channel);
+        var manager = GetManager(request.UserId);
 
         var queueStatuses = new Dictionary<string, Enums.DownloadQueueStatus>();
 
@@ -192,15 +242,7 @@ public class MessageHandler
         {
             if (!queueStatuses.ContainsKey(url))
             {
-                queueStatuses.Add(url, manager.QueueDownload(new DownloadInfo
-                {
-                    ChannelId = message.Channel.Id,
-                    ReplyId = message.Id,
-                    UserId = userId,
-                    VideoUrl = url,
-                    FileSizeLimit = fileSizeLimit,
-                    IsDm = isDm
-                }));
+                queueStatuses.Add(url, manager.QueueDownload(request with { VideoUrl = url }));
             }
         }
 
@@ -235,22 +277,14 @@ public class MessageHandler
             replyBuilder.AppendJoin('\n', queueStatuses.Where(pair => pair.Value == Enums.DownloadQueueStatus.UnknownError).Select(pair => $"`{pair.Key}`"));
         }
 
-        if (isDm)
-        {
-            await message.ReplyAsync(replyBuilder.ToString());
-        }
-        else
-        {
-            var dmChannel = await message.Author.CreateDMChannelAsync();
-            await dmChannel.SendMessageAsync(replyBuilder.ToString());
-        }
+        return replyBuilder.ToString();
     }
 
-    private int GetFileSizeLimit(IChannel channel)
+    private int GetFileSizeLimit(ulong? guildId)
     {
-        if (channel is SocketGuildChannel guildChannel)
+        if (guildId is { } id && client.GetGuild(id) is { } guild)
         {
-            return guildChannel.Guild.PremiumTier switch
+            return guild.PremiumTier switch
             {
                 PremiumTier.Tier2 => 50,
                 PremiumTier.Tier3 => 100,
@@ -258,7 +292,7 @@ public class MessageHandler
             };
         }
 
-        // DMs or unknown channel types fall back to the configured limit
+        // DMs or unknown guilds fall back to the configured limit
         return config.FileSizeLimit;
     }
 
@@ -284,7 +318,22 @@ public class MessageHandler
 
     private async Task HandleHelp(SocketUserMessage message)
     {
-        var fileSizeLimit = GetFileSizeLimit(message.Channel);
+        foreach (var text in HelpMessages((message.Channel as SocketGuildChannel)?.Guild.Id))
+        {
+            try
+            {
+                await message.ReplyAsync(text);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, ex.Message);
+            }
+        }
+    }
+
+    private string[] HelpMessages(ulong? guildId)
+    {
+        var fileSizeLimit = GetFileSizeLimit(guildId);
         var replyBuilder = new StringBuilder($"Hello there, I'm {botName}! I download videos from URLs you send me and send them back to you as video files.");
         replyBuilder.AppendLine();
         replyBuilder.AppendLine();
@@ -294,24 +343,8 @@ public class MessageHandler
         replyBuilder.AppendLine();
         replyBuilder.AppendLine("(I also work without the `/download` command in case you want to use a video app's share feature to send me a video URL directly!)");
 
-        try
-        {
-            await message.ReplyAsync(replyBuilder.ToString());
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, ex.Message);
-        }
+        var limits = $"Also, each user can queue up to {config.DownloadQueueLimit} videos at a time. You can do this by sending multiple messages or alternatively sending multiple video links within the same message separated by line breaks or spaces.";
 
-        replyBuilder = new StringBuilder($"Also, each user can queue up to {config.DownloadQueueLimit} videos at a time. You can do this by sending multiple messages or alternatively sending multiple video links within the same message separated by line breaks or spaces.");
-
-        try
-        {
-            await message.ReplyAsync(replyBuilder.ToString());
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, ex.Message);
-        }
+        return [replyBuilder.ToString(), limits];
     }
 }

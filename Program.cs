@@ -35,6 +35,7 @@ internal class Program
         var app = builder.Build();
 
         app.Services.GetRequiredService<YtDlp>();
+        DownloadManager.DeleteLeftoverFiles();
 
         app.UseHttpsRedirection();
 

@@ -13,7 +13,9 @@ The bot automatically detects the server's boost level and uses the correspondin
 | Tier 3 | 100 MB |
 | DMs | Configurable via `FILE_SIZE_LIMIT` (default 25 MB) |
 
-Optionally, S3-compatible storage (AWS S3, Garage, MinIO, Backblaze B2, etc.) can be configured so users can retrieve the original, untranscoded video. When a video needs transcoding, the bot offers a choice between "Transcode for Discord" and "Get original". Choosing the latter uploads the original file to S3 and sends back a time-limited presigned download URL.
+Optionally, S3-compatible storage (AWS S3, Garage, MinIO, Backblaze B2, etc.) can be configured so users can retrieve the original, untranscoded video. When a video needs transcoding, the bot offers a choice between "Transcode for Discord" and "Get original". Choosing the latter uploads the original file to S3 and sends a time-limited presigned download URL that only the requester can see (an ephemeral reply in servers, or a DM). Unanswered choices expire after an hour, and the original file is deleted.
+
+In servers, the `/download` and `/help` slash commands keep the bot's text replies (queue status, errors, help and the transcode prompt) [ephemeral](https://support.discord.com/hc/en-us/articles/1500000580222-Ephemeral-Messages-FAQ), so only the requester sees them. The video itself is still posted to the channel. Discord only allows replies to a command for 15 minutes, so later messages (for example, after a long queue or transcode) go to the requester's DMs instead. Mentioning the bot still works, but its text replies go to DMs. If the commands don't appear in a server, re-invite the bot with the `applications.commands` scope.
 
 Uses YT-DLP and FFMpeg under the hood. Supports hardware acceleration, but it will fall back to software transcoding.
 
