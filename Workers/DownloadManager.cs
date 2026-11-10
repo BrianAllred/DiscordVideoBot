@@ -196,14 +196,17 @@ public class DownloadManager
 
     private async Task SendVideo(DownloadInfo download, string filePath)
     {
+        // In servers, others see the video, so say who asked for it.
+        var text = download.IsDm ? null : $"From {MentionUtils.MentionUser(download.UserId)}";
+
         // The /download reply is ephemeral, so the video goes out as its own followup that everyone sees.
-        if (await TryFollowup(download.Command, i => i.FollowupWithFileAsync(filePath)))
+        if (await TryFollowup(download.Command, i => i.FollowupWithFileAsync(filePath, text: text)))
             return;
 
         var channel = await client.GetChannelAsync(download.ChannelId) as IMessageChannel;
         if (channel == null) throw new Exception("Channel not found");
 
-        await channel.SendFileAsync(filePath, messageReference: download.ReplyId != 0 ? new MessageReference(download.ReplyId) : null);
+        await channel.SendFileAsync(filePath, text, messageReference: download.ReplyId != 0 ? new MessageReference(download.ReplyId) : null);
     }
 
     /// <summary>
